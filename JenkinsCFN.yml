@@ -1,0 +1,152 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template for a scalable and secure Jenkins setup with Auto Scaling, Load Balancer, and Monitoring'
+
+Parameters:
+  InstType:
+    Type: String
+    Default: t2.micro
+    Description: EC2 Instance Type for Jenkins
+
+  KeyName:
+    Type: String
+    Description: EC2 Key Pair for SSH access
+
+  AmiId:
+    Type: String
+    Default: 'ami-00ddb0e5626798373'
+    Description: AMI ID for Jenkins server
+
+Resources:
+  
+  # Security Group for ALB
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'Allow inbound HTTP traffic to ALB'
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+  # Security Group for ASG
+  ASGSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'Allow inbound traffic only from ALB to Jenkins'
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !GetAtt ALBSecurityGroup.GroupId
+
+  # Application Load Balancer (ALB)
+  JenkinsALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: "JenkinsALB"
+      Subnets: 
+        - !Ref SubnetA
+        - !Ref SubnetB
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Scheme: internet-facing
+      LoadBalancerAttributes:
+        - Key: idle_timeout.timeout_seconds
+          Value: "60"
+
+  # Auto Scaling Launch Configuration
+  JenkinsLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: JenkinsLaunchTemplate
+      VersionDescription: "v1"
+      LaunchTemplateData:
+        InstanceType: !Ref InstType
+        ImageId: !Ref AmiId
+        SecurityGroupIds:
+          - !Ref ASGSecurityGroup
+        KeyName: !Ref KeyName
+        UserData: !Base64 |
+          #!/bin/bash -xe
+          sudo apt update
+          sudo apt install openjdk-8-jdk -y
+          wget -q -O - https://pkg.jenkins.io/debian-stable/jenkins.io.key | sudo apt-key add -
+          sudo sh -c 'echo deb https://pkg.jenkins.io/debian-stable binary/ > /etc/apt/sources.list.d/jenkins.list'
+          sudo apt-get update
+          sudo apt-get install jenkins -y
+          sudo systemctl start jenkins
+          
+  # Auto Scaling Group (ASG)
+  JenkinsAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      DesiredCapacity: 1
+      MaxSize: 5
+      MinSize: 1
+      VPCZoneIdentifier:
+        - !Ref SubnetA
+        - !Ref SubnetB
+      LaunchTemplate:
+        LaunchTemplateName: !Ref JenkinsLaunchTemplate
+      HealthCheckType: EC2
+      HealthCheckGracePeriod: 300
+      Tags:
+        - Key: Name
+          Value: JenkinsInstance
+          PropagateAtLaunch: true
+
+  # CloudWatch Alarm for Scaling
+  CpuUtilizationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: "Alarm when CPU utilization exceeds 80%"
+      Namespace: AWS/EC2
+      MetricName: CPUUtilization
+      Statistic: Average
+      Period: 300
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      EvaluationPeriods: 1
+      AlarmActions:
+        - !Ref ScaleUpPolicy
+
+  # Scale-Up Policy
+  ScaleUpPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref JenkinsAutoScalingGroup
+      PolicyType: SimpleScaling
+      ScalingAdjustment: 1
+      Cooldown: 300
+
+  # CloudWatch Monitoring Role
+  CloudWatchMonitoringRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: "ec2.amazonaws.com"
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: "CloudWatchMonitoringPolicy"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "cloudwatch:PutMetricData"
+                Resource: "*"
+
+Outputs:
+  JenkinsServerURL:
+    Description: "Jenkins Server URL"
+    Value: !Sub "http://${JenkinsALB.DNSName}/"
+
+  JenkinsInitialAdminPassword:
+    Description: "Initial Admin Password location"
+    Value: !Sub "scp -i ${KeyName}.pem ubuntu@${JenkinsAutoScalingGroup.PublicIp}:~/.jenkins/secrets/initialAdminPassword"
+
